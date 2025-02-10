@@ -155,7 +155,7 @@ pub struct RowValues {
 
     /// Tracks for the memory used by in the `Rows` of this
     /// cursor. Freed on drop
-    _reservation: Option<MemoryReservation>,
+    _reservation: MemoryReservation,
 }
 
 impl RowValues {
@@ -164,14 +164,12 @@ impl RowValues {
     ///
     /// Panics if the reservation is not for exactly `rows.size()`
     /// bytes or if `rows` is empty.
-    pub fn new(rows: Rows, reservation: Option<MemoryReservation>) -> Self {
-        if let Some(reservation) = &reservation {
-            assert_eq!(
-                rows.size(),
-                reservation.size(),
-                "memory reservation mismatch"
-            );
-        }
+    pub fn new(rows: Rows, reservation: MemoryReservation) -> Self {
+        assert_eq!(
+            rows.size(),
+            reservation.size(),
+            "memory reservation mismatch"
+        );
         assert!(rows.num_rows() > 0);
         Self {
             rows,

@@ -157,7 +157,7 @@ impl<C: CursorValues> SortPreservingMergeStream<C> {
         metrics: BaselineMetrics,
         batch_size: usize,
         fetch: Option<usize>,
-        reservation: Option<MemoryReservation>,
+        reservation: MemoryReservation,
         enable_round_robin_tie_breaker: bool,
     ) -> Self {
         let stream_count = streams.partitions();

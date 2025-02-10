@@ -87,7 +87,7 @@ pub struct RowCursorStream {
     /// Input streams
     streams: FusedStreams,
     /// Tracks the memory used by `converter`
-    reservation: Option<MemoryReservation>,
+    reservation: MemoryReservation,
 }
 
 impl RowCursorStream {
@@ -95,7 +95,7 @@ impl RowCursorStream {
         schema: &Schema,
         expressions: &LexOrdering,
         streams: Vec<SendableRecordBatchStream>,
-        reservation: Option<MemoryReservation>,
+        reservation: MemoryReservation,
     ) -> Result<Self> {
         let sort_fields = expressions
             .iter()
@@ -123,20 +123,12 @@ impl RowCursorStream {
             .collect::<Result<Vec<_>>>()?;
 
         let rows = self.converter.convert_columns(&cols)?;
+        self.reservation.try_resize(self.converter.size())?;
 
-        match &mut self.reservation {
-            Some(reservation) => {
-                reservation.try_resize(self.converter.size())?;
-
-                // track the memory in the newly created Rows.
-                let mut rows_reservation = reservation.new_empty();
-                rows_reservation.try_grow(rows.size())?;
-                Ok(RowValues::new(rows, Some(rows_reservation)))
-            }
-            None => {
-                Ok(RowValues::new(rows, None))
-            }
-        }
+        // track the memory in the newly created Rows.
+        let mut rows_reservation = self.reservation.new_empty();
+        rows_reservation.try_grow(rows.size())?;
+        Ok(RowValues::new(rows, rows_reservation))
     }
 }
 

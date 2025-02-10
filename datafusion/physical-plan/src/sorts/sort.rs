@@ -441,12 +441,17 @@ impl ExternalSorter {
         // We'll gradually collect the sorted stream into self.in_mem_batches, or directly
         // write sorted batches to disk when the memory is insufficient.
         let mut spill_writer: Option<IPCWriter> = None;
+        let sort_merge_minimum_overhead = self.sort_spill_reservation_bytes / 5;
         while let Some(batch) = sorted_stream.next().await {
             let batch = batch?;
             match &mut spill_writer {
                 None => {
                     let sorted_size = get_record_batch_memory_size(&batch);
                     self.in_mem_batches.push(batch);
+
+                    // We reserve more memory to ensure that we'll have enough memory for
+                    // `SortPreservingMergeStream` after consuming this batch, otherwise we'll
+                    // start spilling everything to disk.
                     if self.reservation.try_grow(sorted_size + sort_merge_minimum_overhead).is_err() {
                         // Directly write in_mem_batches as well as all the remaining batches in
                         // sorted_stream to disk. Further batches fetched from `sorted_stream` will
@@ -459,6 +464,9 @@ impl ExternalSorter {
                         spill_writer = Some(writer);
                         self.reservation.free();
                         self.spills.push(spill_file);
+                    } else {
+                        // Gives back memory for merging the next batch.
+                        self.reservation.shrink(sort_merge_minimum_overhead);
                     }
                 }
                 Some(writer) => {
@@ -574,8 +582,8 @@ impl ExternalSorter {
 
         if self.in_mem_batches.len() == 1 {
             let batch = self.in_mem_batches.swap_remove(0);
-            self.reservation.free();
-            return self.sort_batch_stream(batch, metrics);
+            let reservation = self.reservation.take();
+            return self.sort_batch_stream(batch, metrics, reservation);
         }
 
         // If less than sort_in_place_threshold_bytes, concatenate and sort in place
@@ -583,21 +591,22 @@ impl ExternalSorter {
             // Concatenate memory batches together and sort
             let batch = concat_batches(&self.schema, &self.in_mem_batches)?;
             self.in_mem_batches.clear();
-            self.reservation.free();
-            return self.sort_batch_stream(batch, metrics);
+            self.reservation
+                .try_resize(get_record_batch_memory_size(&batch))?;
+            let reservation = self.reservation.take();
+            return self.sort_batch_stream(batch, metrics, reservation);
         }
 
         let streams = std::mem::take(&mut self.in_mem_batches)
             .into_iter()
             .map(|batch| {
                 let metrics = self.metrics.baseline.intermediate();
-                let input = self.sort_batch_stream(batch, metrics)?;
+                let reservation =
+                    self.reservation.split(get_record_batch_memory_size(&batch));
+                let input = self.sort_batch_stream(batch, metrics, reservation)?;
                 Ok(spawn_buffered(input, 1))
             })
             .collect::<Result<_>>()?;
-        // `in_mem_batches` will be used for merging. The reservation for `in_mem_batches`
-        // is conceptually taken over by merging.
-        self.merge_reservation = self.reservation.take();
 
         let expressions: LexOrdering = self.expr.iter().cloned().collect();
 
@@ -608,6 +617,7 @@ impl ExternalSorter {
             .with_metrics(metrics)
             .with_batch_size(self.batch_size)
             .with_fetch(self.fetch)
+            .with_reservation(self.merge_reservation.new_empty())
             .build()
     }
 
@@ -619,7 +629,9 @@ impl ExternalSorter {
         &self,
         batch: RecordBatch,
         metrics: BaselineMetrics,
+        reservation: MemoryReservation,
     ) -> Result<SendableRecordBatchStream> {
+        assert_eq!(get_record_batch_memory_size(&batch), reservation.size());
         let schema = batch.schema();
 
         let fetch = self.fetch;
@@ -630,6 +642,7 @@ impl ExternalSorter {
             timer.done();
             metrics.record_output(sorted.num_rows());
             drop(batch);
+            drop(reservation);
             Ok(sorted)
         }));
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
