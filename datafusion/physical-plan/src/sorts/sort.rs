@@ -24,7 +24,7 @@ use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use crate::common::spawn_buffered;
+use crate::common::{spawn_buffered, IPCWriter};
 use crate::execution_plan::{Boundedness, CardinalityEffect, EmissionType};
 use crate::expressions::PhysicalSortExpr;
 use crate::limit::LimitStream;
@@ -305,29 +305,12 @@ impl ExternalSorter {
 
         let size = get_record_batch_memory_size(&input);
 
-        if self.reservation.try_grow(size).is_err() {
-            let before = self.reservation.size();
-            self.in_mem_sort().await?;
-
-            // Sorting may have freed memory, especially if fetch is `Some`
-            //
-            // As such we check again, and if the memory usage has dropped by
-            // a factor of 2, and we can allocate the necessary capacity,
-            // we don't spill
-            //
-            // The factor of 2 aims to avoid a degenerate case where the
-            // memory required for `fetch` is just under the memory available,
-            // causing repeated re-sorting of data
-            if self.reservation.size() > before / 2
-                || self.reservation.try_grow(size).is_err()
-            {
-                self.spill().await?;
-                self.reservation.try_grow(size)?
-            }
-        }
-
         self.in_mem_batches.push(input);
         self.in_mem_batches_sorted = false;
+        if self.reservation.try_grow(size).is_err() {
+            self.sort_or_spill_in_mem_batches().await?;
+        }
+
         Ok(())
     }
 
@@ -345,6 +328,11 @@ impl ExternalSorter {
     /// 2. A combined streaming merge incorporating both in-memory
     ///    batches and data from spill files on disk.
     fn sort(&mut self) -> Result<SendableRecordBatchStream> {
+        // Release the memory reserved for merge back to the pool so
+        // there is some left when `in_mem_sort_stream` requests an
+        // allocation.
+        self.merge_reservation.free();
+
         if self.spilled_before() {
             let mut streams = vec![];
             if !self.in_mem_batches.is_empty() {
@@ -409,8 +397,6 @@ impl ExternalSorter {
 
         debug!("Spilling sort data of ExternalSorter to disk whilst inserting");
 
-        self.in_mem_sort().await?;
-
         let spill_file = self.runtime.disk_manager.create_tmp_file("Sorting")?;
         let batches = std::mem::take(&mut self.in_mem_batches);
         let spilled_rows = spill_record_batches(
@@ -427,31 +413,82 @@ impl ExternalSorter {
     }
 
     /// Sorts the in_mem_batches in place
-    async fn in_mem_sort(&mut self) -> Result<()> {
+    ///
+    /// Sorting may have freed memory, especially if fetch is `Some`. If
+    /// the memory usage has dropped by a factor of 2, then we don't have
+    /// to spill. Otherwise, we spill to free up memory for inserting
+    /// more batches.
+    ///
+    /// The factor of 2 aims to avoid a degenerate case where the
+    /// memory required for `fetch` is just under the memory available,
+    // causing repeated re-sorting of data
+    async fn sort_or_spill_in_mem_batches(&mut self) -> Result<()> {
         if self.in_mem_batches_sorted {
             return Ok(());
         }
 
         // Release the memory reserved for merge back to the pool so
-        // there is some left when `in_memo_sort_stream` requests an
+        // there is some left when `in_mem_sort_stream` requests an
         // allocation.
         self.merge_reservation.free();
 
-        self.in_mem_batches = self
-            .in_mem_sort_stream(self.metrics.baseline.intermediate())?
-            .try_collect()
-            .await?;
+        let before = self.reservation.size();
 
-        let size: usize = self
-            .in_mem_batches
-            .iter()
-            .map(get_record_batch_memory_size)
-            .sum();
+        let mut sorted_stream = self.in_mem_sort_stream(
+            self.metrics.baseline.intermediate())?;
 
-        // Reserve headroom for next sort/merge
+        // `self.in_mem_batches` is already taken away by the sort_stream, now it is empty.
+        // We'll gradually collect the sorted stream into self.in_mem_batches, or directly
+        // write sorted batches to disk when the memory is insufficient.
+        let mut spill_writer: Option<IPCWriter> = None;
+        while let Some(batch) = sorted_stream.next().await {
+            let batch = batch?;
+            match &mut spill_writer {
+                None => {
+                    let sorted_size = get_record_batch_memory_size(&batch);
+                    self.in_mem_batches.push(batch);
+                    if self.reservation.try_grow(sorted_size + sort_merge_minimum_overhead).is_err() {
+                        // Directly write in_mem_batches as well as all the remaining batches in
+                        // sorted_stream to disk. Further batches fetched from `sorted_stream` will
+                        // be handled by the `Some(writer)` matching arm.
+                        let spill_file = self.runtime.disk_manager.create_tmp_file("Sorting")?;
+                        let mut writer = IPCWriter::new(spill_file.path().as_ref(), &self.schema)?;
+                        for batch in self.in_mem_batches.drain(..) {
+                            writer.write(&batch)?;
+                        }
+                        spill_writer = Some(writer);
+                        self.reservation.free();
+                        self.spills.push(spill_file);
+                    }
+                }
+                Some(writer) => {
+                    writer.write(&batch)?;
+                }
+            }
+        }
+
+        if let Some(writer) = &mut spill_writer {
+            // writer.finish(&mut self.metrics)?;
+            writer.finish()?;
+            self.metrics.spill_count.add(1);
+            self.metrics.spilled_rows.add(writer.num_rows);
+            self.metrics.spilled_bytes.add(writer.num_bytes);
+        }
+
+        // Sorting may free up some memory especially when fetch is `Some`. If we have
+        // not freed more than 50% of the memory, then we have to spill to free up more
+        // memory for inserting more batches.
+        if spill_writer.is_none() && self.reservation.size() > before / 2 {
+            // We have not freed more than 50% of the memory, so we have to spill to
+            // free up more memory
+            self.spill().await?;
+        }
+
+        // Reserve headroom for next sort/merge. Please note that this may shrink the
+        // reservation since we we have transferred the reservation for `self.in_mem_batches`
+        // to the merge_reservation in `in_mem_sort_stream` when merging is needed.
         self.reserve_memory_for_merge()?;
 
-        self.reservation.try_resize(size)?;
         self.in_mem_batches_sorted = true;
         Ok(())
     }
@@ -529,10 +566,16 @@ impl ExternalSorter {
         let elapsed_compute = metrics.elapsed_compute().clone();
         let _timer = elapsed_compute.timer();
 
+        // Please pay attention that any operation inside of `in_mem_sort_stream` will
+        // not perform any memory reservation. This is for avoiding the need of handling
+        // reservation failure and spilling in the middle of the sort/merge. The memory
+        // space for batches produced by the resulting stream will be reserved by the
+        // consumer of the stream.
+
         if self.in_mem_batches.len() == 1 {
             let batch = self.in_mem_batches.swap_remove(0);
-            let reservation = self.reservation.take();
-            return self.sort_batch_stream(batch, metrics, reservation);
+            self.reservation.free();
+            return self.sort_batch_stream(batch, metrics);
         }
 
         // If less than sort_in_place_threshold_bytes, concatenate and sort in place
@@ -540,22 +583,21 @@ impl ExternalSorter {
             // Concatenate memory batches together and sort
             let batch = concat_batches(&self.schema, &self.in_mem_batches)?;
             self.in_mem_batches.clear();
-            self.reservation
-                .try_resize(get_record_batch_memory_size(&batch))?;
-            let reservation = self.reservation.take();
-            return self.sort_batch_stream(batch, metrics, reservation);
+            self.reservation.free();
+            return self.sort_batch_stream(batch, metrics);
         }
 
         let streams = std::mem::take(&mut self.in_mem_batches)
             .into_iter()
             .map(|batch| {
                 let metrics = self.metrics.baseline.intermediate();
-                let reservation =
-                    self.reservation.split(get_record_batch_memory_size(&batch));
-                let input = self.sort_batch_stream(batch, metrics, reservation)?;
+                let input = self.sort_batch_stream(batch, metrics)?;
                 Ok(spawn_buffered(input, 1))
             })
             .collect::<Result<_>>()?;
+        // `in_mem_batches` will be used for merging. The reservation for `in_mem_batches`
+        // is conceptually taken over by merging.
+        self.merge_reservation = self.reservation.take();
 
         let expressions: LexOrdering = self.expr.iter().cloned().collect();
 
@@ -566,7 +608,6 @@ impl ExternalSorter {
             .with_metrics(metrics)
             .with_batch_size(self.batch_size)
             .with_fetch(self.fetch)
-            .with_reservation(self.merge_reservation.new_empty())
             .build()
     }
 
@@ -578,9 +619,7 @@ impl ExternalSorter {
         &self,
         batch: RecordBatch,
         metrics: BaselineMetrics,
-        reservation: MemoryReservation,
     ) -> Result<SendableRecordBatchStream> {
-        assert_eq!(get_record_batch_memory_size(&batch), reservation.size());
         let schema = batch.schema();
 
         let fetch = self.fetch;
@@ -591,7 +630,6 @@ impl ExternalSorter {
             timer.done();
             metrics.record_output(sorted.num_rows());
             drop(batch);
-            drop(reservation);
             Ok(sorted)
         }));
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -642,7 +680,15 @@ pub fn sort_batch(
         lexsort_to_indices(&sort_columns, fetch)?
     };
 
-    let columns = take_arrays(batch.columns(), &indices, None)?;
+    let mut columns = take_arrays(batch.columns(), &indices, None)?;
+
+    // The columns may be larger than the unsorted columns in `batch` especially for variable length
+    // data types due to exponential growth when building the sort columns. We shrink the columns
+    // to prevent memory reservation failures, as well as excessive memory allocation when running
+    // merges in `SortPreservingMergeStream`.
+    columns.iter_mut().for_each(|c| {
+        c.shrink_to_fit();
+    });
 
     let options = RecordBatchOptions::new().with_row_count(Some(indices.len()));
     Ok(RecordBatch::try_new_with_options(

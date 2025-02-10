@@ -166,8 +166,6 @@ impl<'a> StreamingMergeBuilder<'a> {
         let metrics = metrics.expect("Metrics cannot be empty for streaming merge");
         let batch_size =
             batch_size.expect("Batch size cannot be empty for streaming merge");
-        let reservation =
-            reservation.expect("Reservation cannot be empty for streaming merge");
 
         // Special case single column comparisons with optimized cursor implementations
         if expressions.len() == 1 {
@@ -187,7 +185,7 @@ impl<'a> StreamingMergeBuilder<'a> {
             schema.as_ref(),
             expressions,
             streams,
-            reservation.new_empty(),
+            reservation.as_ref().map(|r| r.new_empty()),
         )?;
         Ok(Box::pin(SortPreservingMergeStream::new(
             Box::new(streams),

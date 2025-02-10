@@ -41,7 +41,7 @@ pub struct BatchBuilder {
     batches: Vec<(usize, RecordBatch)>,
 
     /// Accounts for memory used by buffered batches
-    reservation: MemoryReservation,
+    reservation: Option<MemoryReservation>,
 
     /// The current [`BatchCursor`] for each stream
     cursors: Vec<BatchCursor>,
@@ -57,7 +57,7 @@ impl BatchBuilder {
         schema: SchemaRef,
         stream_count: usize,
         batch_size: usize,
-        reservation: MemoryReservation,
+        reservation: Option<MemoryReservation>,
     ) -> Self {
         Self {
             schema,
@@ -70,8 +70,9 @@ impl BatchBuilder {
 
     /// Append a new batch in `stream_idx`
     pub fn push_batch(&mut self, stream_idx: usize, batch: RecordBatch) -> Result<()> {
-        self.reservation
-            .try_grow(get_record_batch_memory_size(&batch))?;
+        if let Some(reservation) = &mut self.reservation {
+            reservation.try_grow(get_record_batch_memory_size(&batch))?;
+        }
         let batch_idx = self.batches.len();
         self.batches.push((stream_idx, batch));
         self.cursors[stream_idx] = BatchCursor {
@@ -143,7 +144,9 @@ impl BatchBuilder {
                 stream_cursor.batch_idx = retained;
                 retained += 1;
             } else {
-                self.reservation.shrink(get_record_batch_memory_size(batch));
+                if let Some(reservation) = &mut self.reservation {
+                    reservation.shrink(get_record_batch_memory_size(batch));
+                }
             }
             retain
         });
