@@ -434,8 +434,8 @@ impl ExternalSorter {
 
         let before = self.reservation.size();
 
-        let mut sorted_stream = self.in_mem_sort_stream(
-            self.metrics.baseline.intermediate())?;
+        let mut sorted_stream =
+            self.in_mem_sort_stream(self.metrics.baseline.intermediate())?;
 
         // `self.in_mem_batches` is already taken away by the sort_stream, now it is empty.
         // We'll gradually collect the sorted stream into self.in_mem_batches, or directly
@@ -452,12 +452,18 @@ impl ExternalSorter {
                     // We reserve more memory to ensure that we'll have enough memory for
                     // `SortPreservingMergeStream` after consuming this batch, otherwise we'll
                     // start spilling everything to disk.
-                    if self.reservation.try_grow(sorted_size + sort_merge_minimum_overhead).is_err() {
+                    if self
+                        .reservation
+                        .try_grow(sorted_size + sort_merge_minimum_overhead)
+                        .is_err()
+                    {
                         // Directly write in_mem_batches as well as all the remaining batches in
                         // sorted_stream to disk. Further batches fetched from `sorted_stream` will
                         // be handled by the `Some(writer)` matching arm.
-                        let spill_file = self.runtime.disk_manager.create_tmp_file("Sorting")?;
-                        let mut writer = IPCWriter::new(spill_file.path().as_ref(), &self.schema)?;
+                        let spill_file =
+                            self.runtime.disk_manager.create_tmp_file("Sorting")?;
+                        let mut writer =
+                            IPCWriter::new(spill_file.path().as_ref(), &self.schema)?;
                         for batch in self.in_mem_batches.drain(..) {
                             writer.write(&batch)?;
                         }
