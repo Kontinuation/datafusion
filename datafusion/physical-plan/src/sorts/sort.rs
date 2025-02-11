@@ -226,8 +226,6 @@ struct ExternalSorter {
     // ========================================================================
     /// Potentially unsorted in memory buffer
     in_mem_batches: Vec<RecordBatch>,
-    /// if `Self::in_mem_batches` are sorted
-    in_mem_batches_sorted: bool,
 
     /// If data has previously been spilled, the locations of the
     /// spill files (in Arrow IPC format)
@@ -280,7 +278,6 @@ impl ExternalSorter {
         Self {
             schema,
             in_mem_batches: vec![],
-            in_mem_batches_sorted: true,
             spills: vec![],
             expr: expr.into(),
             metrics,
@@ -303,14 +300,16 @@ impl ExternalSorter {
         }
         self.reserve_memory_for_merge()?;
 
+        println!("insert_batch: reservation: {:?}", self.reservation);
+
         let size = get_record_batch_memory_size(&input);
 
-        self.in_mem_batches.push(input);
-        self.in_mem_batches_sorted = false;
         if self.reservation.try_grow(size).is_err() {
             self.sort_or_spill_in_mem_batches().await?;
+            self.reservation.try_grow(size)?;
         }
 
+        self.in_mem_batches.push(input);
         Ok(())
     }
 
@@ -331,7 +330,12 @@ impl ExternalSorter {
         // Release the memory reserved for merge back to the pool so
         // there is some left when `in_mem_sort_stream` requests an
         // allocation.
+        println!(
+            "sort: before free merge reservation: {:?}",
+            self.reservation
+        );
         self.merge_reservation.free();
+        println!("sort: after free merge reservation: {:?}", self.reservation);
 
         if self.spilled_before() {
             let mut streams = vec![];
@@ -423,14 +427,14 @@ impl ExternalSorter {
     /// memory required for `fetch` is just under the memory available,
     // causing repeated re-sorting of data
     async fn sort_or_spill_in_mem_batches(&mut self) -> Result<()> {
-        if self.in_mem_batches_sorted {
-            return Ok(());
-        }
-
         // Release the memory reserved for merge back to the pool so
         // there is some left when `in_mem_sort_stream` requests an
         // allocation.
         self.merge_reservation.free();
+        println!(
+            "sort_or_spill_in_mem_batches: before merging reservation: {:?}",
+            self.reservation
+        );
 
         let before = self.reservation.size();
 
@@ -441,13 +445,18 @@ impl ExternalSorter {
         // We'll gradually collect the sorted stream into self.in_mem_batches, or directly
         // write sorted batches to disk when the memory is insufficient.
         let mut spill_writer: Option<IPCWriter> = None;
-        let sort_merge_minimum_overhead = self.sort_spill_reservation_bytes / 5;
+        // Leave at least 1/3 of spill reservation for sort/merge the next batch. Here the
+        // 1/3 is simply an arbitrary chosen number.
+        let sort_merge_minimum_overhead = self.sort_spill_reservation_bytes / 3;
         while let Some(batch) = sorted_stream.next().await {
             let batch = batch?;
+            println!(
+                "sort_or_spill_in_mem_batches: reservation: {:?}",
+                self.reservation
+            );
             match &mut spill_writer {
                 None => {
                     let sorted_size = get_record_batch_memory_size(&batch);
-                    self.in_mem_batches.push(batch);
 
                     // We reserve more memory to ensure that we'll have enough memory for
                     // `SortPreservingMergeStream` after consuming this batch, otherwise we'll
@@ -464,13 +473,19 @@ impl ExternalSorter {
                             self.runtime.disk_manager.create_tmp_file("Sorting")?;
                         let mut writer =
                             IPCWriter::new(spill_file.path().as_ref(), &self.schema)?;
+                        // Flush everything in memory to the spill file
                         for batch in self.in_mem_batches.drain(..) {
                             writer.write(&batch)?;
                         }
+                        // as well as the newly sorted batch
+                        writer.write(&batch)?;
                         spill_writer = Some(writer);
                         self.reservation.free();
                         self.spills.push(spill_file);
+                        println!("spill during merging");
                     } else {
+                        self.in_mem_batches.push(batch);
+
                         // Gives back memory for merging the next batch.
                         self.reservation.shrink(sort_merge_minimum_overhead);
                     }
@@ -482,7 +497,6 @@ impl ExternalSorter {
         }
 
         if let Some(writer) = &mut spill_writer {
-            // writer.finish(&mut self.metrics)?;
             writer.finish()?;
             self.metrics.spill_count.add(1);
             self.metrics.spilled_rows.add(writer.num_rows);
@@ -503,7 +517,6 @@ impl ExternalSorter {
         // to the merge_reservation in `in_mem_sort_stream` when merging is needed.
         self.reserve_memory_for_merge()?;
 
-        self.in_mem_batches_sorted = true;
         Ok(())
     }
 
@@ -646,6 +659,11 @@ impl ExternalSorter {
             let timer = metrics.elapsed_compute().timer();
             let sorted = sort_batch(&batch, &expressions, fetch)?;
             timer.done();
+            println!(
+                "sort_batch. before_sorting: {}, after_sorting: {}",
+                get_record_batch_memory_size(&batch),
+                get_record_batch_memory_size(&sorted)
+            );
             metrics.record_output(sorted.num_rows());
             drop(batch);
             drop(reservation);
@@ -1312,6 +1330,9 @@ mod tests {
                 .with_runtime(runtime),
         );
 
+        // The input has 100 partitions, each partition has a batch containing 100 rows.
+        // Each row has a single Int32 column with values 0..100. The total size of the
+        // input is roughly 40000 bytes.
         let partitions = 100;
         let input = test::scan_partitioned(partitions);
         let schema = input.schema();
@@ -1337,15 +1358,88 @@ mod tests {
 
         assert_eq!(metrics.output_rows().unwrap(), 10000);
         assert!(metrics.elapsed_compute().unwrap() > 0);
-        assert_eq!(metrics.spill_count().unwrap(), 3);
-        assert_eq!(metrics.spilled_bytes().unwrap(), 36000);
-        assert_eq!(metrics.spilled_rows().unwrap(), 9000);
+
+        let spill_count = metrics.spill_count().unwrap();
+        let spilled_rows = metrics.spilled_rows().unwrap();
+        let spilled_bytes = metrics.spilled_bytes().unwrap();
+        // Processing 40000 bytes of data using 12288 bytes of memory requires 3 spills
+        // unless we do something really clever. It will spill roughly 9000+ rows and 36000
+        // bytes. We leave a little wiggle room for the actual numbers.
+        assert!(spill_count >= 3 && spill_count <= 5);
+        assert!(spilled_rows >= 9000 && spilled_rows <= 10000);
+        assert!(spilled_bytes >= 36000 && spilled_bytes <= 40000);
 
         let columns = result[0].columns();
 
         let i = as_primitive_array::<Int32Type>(&columns[0])?;
         assert_eq!(i.value(0), 0);
         assert_eq!(i.value(i.len() - 1), 81);
+
+        assert_eq!(
+            task_ctx.runtime_env().memory_pool.reserved(),
+            0,
+            "The sort should have returned all memory used back to the memory manager"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_sort_spill_utf8_strings() -> Result<()> {
+        let session_config = SessionConfig::new()
+            .with_batch_size(100)
+            .with_sort_in_place_threshold_bytes(20 * 1024)
+            .with_sort_spill_reservation_bytes(100 * 1024);
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(500 * 1024, 1.0)
+            .build_arc()?;
+        let task_ctx = Arc::new(
+            TaskContext::default()
+                .with_session_config(session_config)
+                .with_runtime(runtime),
+        );
+
+        // The input has 200 partitions, each partition has a batch containing 100 rows.
+        // Each row has a single Utf8 column, the Utf8 string values are roughly 42 bytes.
+        // The total size of the input is roughly 8.4 KB.
+        let input = test::scan_partitioned_utf8(200);
+        let schema = input.schema();
+
+        let sort_exec = Arc::new(SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr {
+                expr: col("i", &schema)?,
+                options: SortOptions::default(),
+            }]),
+            Arc::new(CoalescePartitionsExec::new(input)),
+        ));
+
+        let result = collect(
+            Arc::clone(&sort_exec) as Arc<dyn ExecutionPlan>,
+            Arc::clone(&task_ctx),
+        )
+        .await?;
+
+        let num_rows = result.iter().map(|batch| batch.num_rows()).sum::<usize>();
+        assert_eq!(num_rows, 20000);
+
+        // Now, validate metrics
+        let metrics = sort_exec.metrics().unwrap();
+
+        assert_eq!(metrics.output_rows().unwrap(), 20000);
+        assert!(metrics.elapsed_compute().unwrap() > 0);
+
+        let spill_count = metrics.spill_count().unwrap();
+        let spilled_rows = metrics.spilled_rows().unwrap();
+        let spilled_bytes = metrics.spilled_bytes().unwrap();
+        println!("spill_count: {spill_count}");
+        println!("spilled_rows: {spilled_rows}");
+        println!("spilled_bytes: {spilled_bytes}");
+        // Processing 840 KB of data using 400 KB of memory requires 2 spills
+        // It will spill roughly 18000 rows and 800 KBytes.
+        // We leave a little wiggle room for the actual numbers.
+        assert!(spill_count >= 2 && spill_count <= 3);
+        assert!(spilled_rows >= 15000 && spilled_rows <= 20000);
+        assert!(spilled_bytes >= 700000 && spilled_bytes <= 900000);
 
         assert_eq!(
             task_ctx.runtime_env().memory_pool.reserved(),
