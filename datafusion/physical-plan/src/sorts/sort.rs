@@ -300,12 +300,12 @@ impl ExternalSorter {
         }
         self.reserve_memory_for_merge()?;
 
-        println!("insert_batch: reservation: {:?}", self.reservation);
-
         let size = get_record_batch_memory_size(&input);
-
         if self.reservation.try_grow(size).is_err() {
             self.sort_or_spill_in_mem_batches().await?;
+            // We've already freed more than half of reserved memory,
+            // so we can grow the reservation again. There's nothing we can do
+            // if this try_grow fails.
             self.reservation.try_grow(size)?;
         }
 
@@ -330,12 +330,7 @@ impl ExternalSorter {
         // Release the memory reserved for merge back to the pool so
         // there is some left when `in_mem_sort_stream` requests an
         // allocation.
-        println!(
-            "sort: before free merge reservation: {:?}",
-            self.reservation
-        );
         self.merge_reservation.free();
-        println!("sort: after free merge reservation: {:?}", self.reservation);
 
         if self.spilled_before() {
             let mut streams = vec![];
@@ -431,10 +426,6 @@ impl ExternalSorter {
         // there is some left when `in_mem_sort_stream` requests an
         // allocation.
         self.merge_reservation.free();
-        println!(
-            "sort_or_spill_in_mem_batches: before merging reservation: {:?}",
-            self.reservation
-        );
 
         let before = self.reservation.size();
 
@@ -450,10 +441,6 @@ impl ExternalSorter {
         let sort_merge_minimum_overhead = self.sort_spill_reservation_bytes / 3;
         while let Some(batch) = sorted_stream.next().await {
             let batch = batch?;
-            println!(
-                "sort_or_spill_in_mem_batches: reservation: {:?}",
-                self.reservation
-            );
             match &mut spill_writer {
                 None => {
                     let sorted_size = get_record_batch_memory_size(&batch);
@@ -482,7 +469,6 @@ impl ExternalSorter {
                         spill_writer = Some(writer);
                         self.reservation.free();
                         self.spills.push(spill_file);
-                        println!("spill during merging");
                     } else {
                         self.in_mem_batches.push(batch);
 
@@ -659,11 +645,6 @@ impl ExternalSorter {
             let timer = metrics.elapsed_compute().timer();
             let sorted = sort_batch(&batch, &expressions, fetch)?;
             timer.done();
-            println!(
-                "sort_batch. before_sorting: {}, after_sorting: {}",
-                get_record_batch_memory_size(&batch),
-                get_record_batch_memory_size(&sorted)
-            );
             metrics.record_output(sorted.num_rows());
             drop(batch);
             drop(reservation);
@@ -1431,15 +1412,20 @@ mod tests {
         let spill_count = metrics.spill_count().unwrap();
         let spilled_rows = metrics.spilled_rows().unwrap();
         let spilled_bytes = metrics.spilled_bytes().unwrap();
-        println!("spill_count: {spill_count}");
-        println!("spilled_rows: {spilled_rows}");
-        println!("spilled_bytes: {spilled_bytes}");
         // Processing 840 KB of data using 400 KB of memory requires 2 spills
         // It will spill roughly 18000 rows and 800 KBytes.
         // We leave a little wiggle room for the actual numbers.
         assert!(spill_count >= 2 && spill_count <= 3);
         assert!(spilled_rows >= 15000 && spilled_rows <= 20000);
         assert!(spilled_bytes >= 700000 && spilled_bytes <= 900000);
+
+        // Verify that the result is sorted
+        let concated_result = concat_batches(&schema, &result)?;
+        let columns = concated_result.columns();
+        let string_array = as_string_array(&columns[0]);
+        for i in 0..string_array.len() - 1 {
+            assert!(string_array.value(i) <= string_array.value(i + 1));
+        }
 
         assert_eq!(
             task_ctx.runtime_env().memory_pool.reserved(),
