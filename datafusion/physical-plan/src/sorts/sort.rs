@@ -357,7 +357,7 @@ impl ExternalSorter {
                 .with_metrics(self.metrics.baseline.clone())
                 .with_batch_size(self.batch_size)
                 .with_fetch(self.fetch)
-                .with_reservation(self.reservation.new_empty())
+                .with_reservation(self.merge_reservation.new_empty())
                 .build()
         } else {
             self.in_mem_sort_stream(self.metrics.baseline.clone())
