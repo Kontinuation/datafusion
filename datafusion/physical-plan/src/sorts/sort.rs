@@ -300,7 +300,7 @@ impl ExternalSorter {
         }
         self.reserve_memory_for_merge()?;
 
-        let size = get_record_batch_memory_size(&input);
+        let size = get_reserved_byte_for_record_batch(&input);
         if self.reservation.try_grow(size).is_err() {
             self.sort_or_spill_in_mem_batches().await?;
             // We've already freed more than half of reserved memory,
@@ -398,14 +398,14 @@ impl ExternalSorter {
 
         let spill_file = self.runtime.disk_manager.create_tmp_file("Sorting")?;
         let batches = std::mem::take(&mut self.in_mem_batches);
-        let spilled_rows = spill_record_batches(
+        let (spilled_rows, spilled_bytes) = spill_record_batches(
             batches,
             spill_file.path().into(),
             Arc::clone(&self.schema),
         )?;
         let used = self.reservation.free();
         self.metrics.spill_count.add(1);
-        self.metrics.spilled_bytes.add(used);
+        self.metrics.spilled_bytes.add(spilled_bytes);
         self.metrics.spilled_rows.add(spilled_rows);
         self.spills.push(spill_file);
         Ok(used)
@@ -443,7 +443,7 @@ impl ExternalSorter {
             let batch = batch?;
             match &mut spill_writer {
                 None => {
-                    let sorted_size = get_record_batch_memory_size(&batch);
+                    let sorted_size = get_reserved_byte_for_record_batch(&batch);
 
                     // We reserve more memory to ensure that we'll have enough memory for
                     // `SortPreservingMergeStream` after consuming this batch, otherwise we'll
@@ -482,6 +482,10 @@ impl ExternalSorter {
             }
         }
 
+        // Drop early to free up memory reserved by the sorted stream, otherwise the
+        // upcoming `self.reserve_memory_for_merge()` may fail due to insufficient memory.
+        drop(sorted_stream);
+
         if let Some(writer) = &mut spill_writer {
             writer.finish()?;
             self.metrics.spill_count.add(1);
@@ -498,9 +502,7 @@ impl ExternalSorter {
             self.spill().await?;
         }
 
-        // Reserve headroom for next sort/merge. Please note that this may shrink the
-        // reservation since we we have transferred the reservation for `self.in_mem_batches`
-        // to the merge_reservation in `in_mem_sort_stream` when merging is needed.
+        // Reserve headroom for next sort/merge
         self.reserve_memory_for_merge()?;
 
         Ok(())
@@ -597,7 +599,7 @@ impl ExternalSorter {
             let batch = concat_batches(&self.schema, &self.in_mem_batches)?;
             self.in_mem_batches.clear();
             self.reservation
-                .try_resize(get_record_batch_memory_size(&batch))?;
+                .try_resize(get_reserved_byte_for_record_batch(&batch))?;
             let reservation = self.reservation.take();
             return self.sort_batch_stream(batch, metrics, reservation);
         }
@@ -606,8 +608,9 @@ impl ExternalSorter {
             .into_iter()
             .map(|batch| {
                 let metrics = self.metrics.baseline.intermediate();
-                let reservation =
-                    self.reservation.split(get_record_batch_memory_size(&batch));
+                let reservation = self
+                    .reservation
+                    .split(get_reserved_byte_for_record_batch(&batch));
                 let input = self.sort_batch_stream(batch, metrics, reservation)?;
                 Ok(spawn_buffered(input, 1))
             })
@@ -636,7 +639,10 @@ impl ExternalSorter {
         metrics: BaselineMetrics,
         reservation: MemoryReservation,
     ) -> Result<SendableRecordBatchStream> {
-        assert_eq!(get_record_batch_memory_size(&batch), reservation.size());
+        assert_eq!(
+            get_reserved_byte_for_record_batch(&batch),
+            reservation.size()
+        );
         let schema = batch.schema();
 
         let fetch = self.fetch;
@@ -667,6 +673,20 @@ impl ExternalSorter {
 
         Ok(())
     }
+}
+
+/// Estimate how much memory is needed to sort a `RecordBatch`.
+///
+/// This is used to pre-reserve memory for the sort/merge. The sort/merge process involves
+/// creating sorted copies of sorted columns in record batches, the sorted copies could be
+/// in either row format or array format. Please refer to cursor.rs and stream.rs for more
+/// details. No matter what format the sorted copies are, they will use more memory than
+/// the original record batch.
+fn get_reserved_byte_for_record_batch(batch: &RecordBatch) -> usize {
+    // 2x may not be enough for some cases, but it's a good start.
+    // If 2x is not enough, user can set a larger value for `sort_spill_reservation_bytes`
+    // to compensate for the extra memory needed.
+    get_record_batch_memory_size(batch) * 2
 }
 
 impl Debug for ExternalSorter {
@@ -1346,7 +1366,7 @@ mod tests {
         // Processing 40000 bytes of data using 12288 bytes of memory requires 3 spills
         // unless we do something really clever. It will spill roughly 9000+ rows and 36000
         // bytes. We leave a little wiggle room for the actual numbers.
-        assert!(spill_count >= 3 && spill_count <= 5);
+        assert!(spill_count >= 3 && spill_count <= 10);
         assert!(spilled_rows >= 9000 && spilled_rows <= 10000);
         assert!(spilled_bytes >= 36000 && spilled_bytes <= 40000);
 
@@ -1412,10 +1432,10 @@ mod tests {
         let spill_count = metrics.spill_count().unwrap();
         let spilled_rows = metrics.spilled_rows().unwrap();
         let spilled_bytes = metrics.spilled_bytes().unwrap();
-        // Processing 840 KB of data using 400 KB of memory requires 2 spills
+        // Processing 840 KB of data using 400 KB of memory requires at least 2 spills
         // It will spill roughly 18000 rows and 800 KBytes.
         // We leave a little wiggle room for the actual numbers.
-        assert!(spill_count >= 2 && spill_count <= 3);
+        assert!(spill_count >= 2 && spill_count <= 10);
         assert!(spilled_rows >= 15000 && spilled_rows <= 20000);
         assert!(spilled_bytes >= 700000 && spilled_bytes <= 900000);
 
