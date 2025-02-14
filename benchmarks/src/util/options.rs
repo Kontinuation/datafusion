@@ -81,6 +81,11 @@ impl CommonOpt {
                 config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
         }
         config
+            .options_mut()
+            .execution
+            .parquet
+            .schema_force_view_types = false;
+        config
     }
 
     /// Return an appropriately configured `RuntimeEnvBuilder`
